@@ -1,0 +1,53 @@
+name: Notify Slack on new Codecademy/docs issues
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # runs every 5 minutes (minimum practical frequency)
+  workflow_dispatch:        # allow manual runs from the Actions tab
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Compute time window (last 6 minutes, UTC)
+        id: window
+        run: |
+          THRESHOLD=$(date -u -d '6 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')
+          echo "threshold=$THRESHOLD" >> $GITHUB_OUTPUT
+
+      - name: Fetch newest open issues from Codecademy/docs
+        run: |
+          curl -s "https://api.github.com/repos/Codecademy/docs/issues?state=open&per_page=30&sort=created&direction=desc" > issues.json
+          echo "Fetched issues:"
+          jq '.[0:3] | map({title, created_at})' issues.json
+
+      - name: Filter issues created within the window (exclude PRs)
+        id: filter
+        run: |
+          jq --arg t "${{ steps.window.outputs.threshold }}" \
+             '[.[] | select(.pull_request? == null) | select(.created_at >= $t)]' issues.json > new_issues.json
+          COUNT=$(jq 'length' new_issues.json)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "New issues in window: $COUNT"
+          jq '.' new_issues.json
+
+      - name: Post each new issue to Slack
+        if: steps.filter.outputs.count != '0'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          while IFS= read -r row; do
+            TITLE=$(echo "$row" | jq -r '.title')
+            URL=$(echo "$row"   | jq -r '.html_url')
+            CREATOR=$(echo "$row" | jq -r '.user.login')
+            CREATED=$(echo "$row"  | jq -r '.created_at')
+            TEXT="*New issue* in \`Codecademy/docs\` by \`${CREATOR}\` at ${CREATED}:\n• ${TITLE}\n${URL}"
+            curl -s -X POST -H 'Content-type: application/json' \
+                 --data "$(jq -n --arg text "$TEXT" '{text:$text}')" \
+                 "$SLACK_WEBHOOK_URL"
+            echo "Posted: $TITLE"
+          done < <(jq -c '.[]' new_issues.json)
